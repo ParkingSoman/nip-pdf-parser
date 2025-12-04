@@ -13,6 +13,7 @@ from jsonschema import validate, ValidationError
 
 DEBUG = True
 
+WORKER_NUM = 2
 
 def debug(*args):
     if DEBUG:
@@ -308,7 +309,7 @@ def convert_contexts(contexts, pdf_path, source_url=None):
 
     print(f"⚙️ Running {len(contexts)} contexts...\n")
 
-    with ThreadPoolExecutor(max_workers=2) as pool:
+    with ThreadPoolExecutor(max_workers=WORKER_NUM) as pool:
         futures = [pool.submit(worker, i, c) for i, c in enumerate(contexts)]
         for i, _ in enumerate(as_completed(futures), start=1):
             print(f"  ✓ Completed {i}/{len(futures)}")
