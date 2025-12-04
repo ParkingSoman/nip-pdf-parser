@@ -6,14 +6,18 @@ import traceback
 from nltk.tokenize import sent_tokenize
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import spacy
+import threading
+from hashlib import sha256
 
 from jsonschema import validate, ValidationError
 
-
 DEBUG = True
+
+
 def debug(*args):
     if DEBUG:
         print(*args)
+
 
 MODEL = "qwen2.5:7b-instruct"
 MAX_DATE_WORDS = 300
@@ -28,6 +32,8 @@ money_regex = re.compile(
     r"(?:\$|USD)?\s*\d{1,3}(?:,\d{3})*(?:\.\d+)?\s*(?:k|m|b|bn|thousand|million|billion)?\b",
     re.IGNORECASE,
 )
+
+print_lock = threading.Lock()
 
 # ----------------- TEXT EXTRACT -----------------
 def extract_first_words(pdf_path, max_words):
@@ -108,8 +114,6 @@ JSON_SCHEMA = {
 }
 
 
-
-
 # ----------------- PROMPTS -----------------
 SYSTEM_PROMPT = """
 You are a STRICT JSON extractor for U.S. intelligence budget documents.
@@ -140,6 +144,9 @@ RULES FOR "number" + "number_type"
     "Total Budget": clearly a total allocation
     "Increase": explicitly compared and higher
     "Decrease": explicitly compared and lower
+- The value MUST NOT contain any URL, link, file path, or reference such as:
+    "http", "https", "www", ".com", ".pdf"
+- Ignore any citations, document URLs, or hyperlinks. They are not budget values.
 
 2️⃣ Budget Share (number_type = "Percentage")
 - A percent value appears in context
@@ -183,8 +190,6 @@ OUTPUT FORMAT
 """
 
 
-
-
 DATE_INFER_SYSTEM_PROMPT = """
 Extract the document year.
 
@@ -207,7 +212,7 @@ def call_ollama_api(system_prompt: str, user: str, is_date_inference=False):
         "stream": False,
         "format": JSON_SCHEMA if not is_date_inference else "json",
         "options": {
-            "temperature": 0.0 # consistent output
+            "temperature": 0.0  # consistent output
         },
     }
 
@@ -232,31 +237,41 @@ def infer_date_from_pdf_first_words(pdf_path):
 
     try:
         return json.loads(raw).get("date")
-    except:
+    except Exception:
         return None
 
 
 # ----------------- MAIN PROCESSING -----------------
-def convert_contexts(contexts, pdf_path):
+def convert_contexts(contexts, pdf_path, source_url=None):
+    """
+    contexts: list of context strings (as before)
+    pdf_path: local path to the PDF
+    source_url: original URL (new, optional but recommended)
+    """
     print(f"\n📊 Processing: {pdf_path}")
     fallback_date = infer_date_from_pdf_first_words(pdf_path) or "Unknown"
     fallback_src = "inferred" if fallback_date != "Unknown" else "unknown"
     print(f"🗓 Fallback date: {fallback_date} ({fallback_src})")
 
+    # 🔐 Cryptographic binding to PDF content
+    with open(pdf_path, "rb") as f:
+        pdf_bytes = f.read()
+    pdf_hash = sha256(pdf_bytes).hexdigest()
+
     results = []
 
-    def worker(ctx):
+    def worker(idx, ctx):
         user = f"Fallback Date: {fallback_date}\nContext:\n{ctx}"
         raw = call_ollama_api(SYSTEM_PROMPT, user)
 
-        # Print debug for context + JSON together (pre-parse!), locked in one thread
-        if DEBUG:
-            print("\n=== CONTEXT BEGIN ===")
-            print(ctx[:1000])  # or however much you want
-            print("--- JSON RAW BEGIN ---")
-            print(raw)
-            print("=== DEBUG BLOCK END ===\n")
-
+        # Debug block per-thread, but prints are locked to avoid interleaving
+        with print_lock:
+            if DEBUG:
+                print("\n=== CONTEXT BEGIN ===")
+                print(ctx[:1000])
+                print("--- JSON RAW BEGIN ---")
+                print(raw)
+                print("=== DEBUG BLOCK END ===\n")
 
         try:
             data = json.loads(raw)
@@ -264,7 +279,6 @@ def convert_contexts(contexts, pdf_path):
             print(e)
             print("⚠️ JSON parse issue — skipping")
             return
-        
 
         if not isinstance(data, list):
             print("⚠️ Expected JSON array — skipping")
@@ -282,19 +296,22 @@ def convert_contexts(contexts, pdf_path):
                 print(f"⚠️ Local schema reject: {e.message}")
                 continue
 
-            if not isinstance(item, dict):
-                continue
-
+            # Add provenance + context
             item["context"] = ctx
+            item["context_index"] = idx
+            item["source_pdf"] = pdf_path
+            if source_url is not None:
+                item["source_url"] = source_url
+            item["source_pdf_hash"] = pdf_hash
+
             results.append(item)
 
     print(f"⚙️ Running {len(contexts)} contexts...\n")
 
     with ThreadPoolExecutor(max_workers=2) as pool:
-        futures = [pool.submit(worker, c) for c in contexts]
+        futures = [pool.submit(worker, i, c) for i, c in enumerate(contexts)]
         for i, _ in enumerate(as_completed(futures), start=1):
             print(f"  ✓ Completed {i}/{len(futures)}")
-
 
     out = pdf_path.replace(".pdf", "_extracted.json")
     with open(out, "w") as f:
